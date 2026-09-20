@@ -66,22 +66,38 @@ class GeminiClient:
                     "Verify your GEMINI_API_KEY is correct."
                 )
 
-        if self._sdk == "genai":
-            resp = self._client.models.generate_content(
-                model=self._model, contents=prompt
-            )
-        else:
-            resp = self._client.generate_content(prompt)
-
-        return resp.text.strip()
+        try:
+            if self._sdk == "genai":
+                resp = self._client.models.generate_content(
+                    model=self._model, contents=prompt
+                )
+            else:
+                resp = self._client.generate_content(prompt)
+            return resp.text.strip()
+        except Exception as exc:
+            err_msg = str(exc)
+            if "429" in err_msg or "RESOURCE_EXHAUSTED" in err_msg or "Quota exceeded" in err_msg:
+                raise RuntimeError(
+                    "Gemini API free-tier rate limit reached. "
+                    "Please wait 10–15 seconds and try again."
+                ) from exc
+            raise
 
 
 # ── SQL helpers ───────────────────────────────────────────────────────────────
 
-def _strip_code_fences(text: str) -> str:
-    """Remove ```sql ... ``` or ``` ... ``` wrappers from generated SQL."""
-    match = re.search(r"```(?:sql)?(.*?)```", text, re.DOTALL | re.IGNORECASE)
-    return (match.group(1) if match else text).strip().rstrip(";").strip("`")
+def _extract_sql(text: str) -> str:
+    """Extract clean SQL from code blocks or raw text."""
+    # Look for code fences first
+    match = re.search(r"```(?:sql)?\s*(.*?)\s*```", text, re.DOTALL | re.IGNORECASE)
+    cleaned = match.group(1) if match else text
+
+    # Extract strictly from SELECT or WITH to end
+    sql_match = re.search(r"\b(SELECT|WITH)\b.*", cleaned, re.DOTALL | re.IGNORECASE)
+    if sql_match:
+        cleaned = sql_match.group(0)
+
+    return cleaned.strip().rstrip(";").strip("`")
 
 
 # ── Public service function ───────────────────────────────────────────────────
@@ -128,7 +144,7 @@ SQLite Query:"""
 
     try:
         raw_sql  = client.generate(sql_prompt)
-        sql_query = _strip_code_fences(raw_sql)
+        sql_query = _extract_sql(raw_sql)
     except Exception as exc:
         return {
             "question": question, "sql_query": None,
@@ -136,7 +152,7 @@ SQLite Query:"""
             "answer": f"SQL generation failed: {exc}", "status": "error",
         }
 
-    # ── Stage 2: Validate & Execute SQL ──────────────────────────────────────
+    # ── Stage 2: Validate & Execute SQL (with 1-shot self-healing retry) ──────
     ok, reason = is_safe_sql(sql_query)
     if not ok:
         return {
@@ -148,11 +164,28 @@ SQLite Query:"""
     try:
         results, columns = run_query(sql_query)
     except Exception as exc:
-        return {
-            "question": question, "sql_query": sql_query,
-            "columns": [], "results": [], "row_count": 0,
-            "answer": f"SQL execution error: {exc}", "status": "error",
-        }
+        # Self-healing retry: re-prompt Gemini with the database error to auto-correct
+        try:
+            retry_prompt = f"""The previous SQLite query failed with an execution error.
+Failed Query: {sql_query}
+Database Error: {exc}
+Original User Question: {question}
+
+{TABLE_SCHEMA_CONTEXT}
+
+Fix the query and return ONLY the corrected read-only SQLite SELECT query:"""
+            retry_raw = client.generate(retry_prompt)
+            sql_query = _extract_sql(retry_raw)
+            ok, reason = is_safe_sql(sql_query)
+            if not ok:
+                raise ValueError(f"Corrected SQL failed safety check: {reason}")
+            results, columns = run_query(sql_query)
+        except Exception as retry_exc:
+            return {
+                "question": question, "sql_query": sql_query,
+                "columns": [], "results": [], "row_count": 0,
+                "answer": f"SQL execution error: {retry_exc}", "status": "error",
+            }
 
     # ── Stage 3: Synthesise natural-language answer ──────────────────────────
     synth_prompt = f"""You are a concise Customer Support Analytics assistant.
